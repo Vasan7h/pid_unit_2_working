@@ -1,0 +1,837 @@
+#include <sys/ioctl.h>
+#include <linux/spi/spidev.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <math.h>
+#include "spi_functions.h"
+
+#include "gpio.h"
+#include "adc.h"
+#include "uart.h"
+#include "i2c_custom.h"
+#include "analog.h"
+
+
+//***********************************************   UNIT  2   *****************************************
+//edited for small increment as 2   --- 1
+//changed small increment as 1      --- 2
+//edited for rounding power values  --- 3
+// ""              ""               --- 4
+//random power values implemented   --- 5 counter implemented,function modified 4
+// count value increased            --- 6 min lim 10,2
+//delay as 20 ms,tolerance is 2%    --- 7
+//OFFSET    removed                 --- 8
+//out limited for 600w              --- 9
+//condition for small change opti,1, - 10
+//tolerance changed to 1%           --- 11
+//forw =0.1% out check in PID control,2 -- 12
+//edited for accuracy,5                ---13
+
+int fault_flag = 0, interlock_flag = 0, ref_fault_flag = 0, overheat_warn_flag = 0;
+float forward_power = 0;
+long double forw = 0;int count=1;
+double out; //RF input 
+double final_forward_power_init; //forw power outside PID loop
+double final_forward_power_temp; //forw power within PID control
+double final_forward_power;//forw power inside PID when stable o/p
+double t_temp=(0.1*240); //10% of max DAC value (actual 255) , limited for 600W
+double I_pe=0; //previous error 
+double D_pe=0;  //previous error
+uint32_t prev_temp=0; //previous DAC value
+double I_temp=0; // integrator (accumulation of error)
+double D_temp=0; //derivative (change in error)
+double kp =0; //proportional gain 0.1 % 
+double ki = 0.001; //integral gain 0.1 %
+double kd =0.001; //differential gain 0.1 %
+float offset; //temp conversion offset 
+double P_control; //proportional term
+double I_control; //integral term
+double D_control; // differential term
+double error; //error
+int exit_flag = 1; //flag for exiting PID control
+int power_temp;
+int32_t temp_PID;
+uint32_t temp; //DAC value 
+int temp_f;
+char set_flag_rev = 0, set_flag_for = 0,set_matched_flag_for=1,set_matched_flag_rev=1;uint8_t matched_condition;
+//uint8_t init =0; int setting_power_buffer[2];
+printf("**********************PLASMA GENERATOR UNIT 2  ****************************");
+int spi_main()
+{
+    unsigned char output;
+    uint8_t address = 0, tx_data[2] = {0};
+    // spi initial setup
+    int SPI1SS1_ADC_MCU_fd = spi_init_setup(1);
+    if (SPI1SS1_ADC_MCU_fd != -1)
+        printf("SPI initial setup for SPI1SS1_ADC_MCU_fd successful\n");
+    int DAC_spi_fd = spi_initial_setup(2);
+    if (DAC_spi_fd != -1)
+        printf("SPI initial setup for pps control successful\n");
+    int EMB_spi_fd = spi_init_setup(3);
+    if (EMB_spi_fd != -1)
+        printf("SPI initial setup for meter board successful\n");
+    // i2c temperature sensor initialization
+    Temp_i2c_readwrite_init();
+    // Configuring the SPI_FDs
+    printf("Configuring SPI ... \n");
+
+    if (spi_setup(DAC_spi_fd) < 0)
+    {
+        printf("SPI configuration for DAC failed !\nExiting Program ...\n");
+        exit(-1);
+    }
+    else
+        printf("SPI configuration for DAC successful\n");
+    if (spi_configuration(SPI1SS1_ADC_MCU_fd, 3) < 0)
+    {
+        printf("SPI configuration for SPI1SS1_ADC_MCU_fd failed !\nExiting Program ...\n");
+        exit(-1);
+    }
+    else
+        printf("SPI configuration for SPI1SS1_ADC_MCU_fd successful\n");
+    if (spi_configuration(EMB_spi_fd, 1) < 0)
+    {
+        printf("SPI configuration for EMB failed !\nExiting Program ...\n");
+        exit(-1);
+    }
+    else
+        printf("SPI configuration for EMB successful\n");
+    if (DAC_begin(DAC_spi_fd, spi1_trx) < 0)
+        perror("Error : ");
+    int DAC_forw_ref_pow_spi_fd = spi_initial_setup(0);
+    if (DAC_forw_ref_pow_spi_fd != -1)
+        printf("SPI initial setup for reading forward and reflected power in connector successful\n");
+    if (spi_setup(DAC_forw_ref_pow_spi_fd) < 0)
+    {
+        printf("SPI configuration for DAC_FORW_REF_POW failed !\nExiting Program ...\n");
+        exit(-1);
+    }
+    else
+        printf("SPI configuration for DAC_FORW_REF_POW successful\n");
+    if (DAC_begin(DAC_forw_ref_pow_spi_fd, spi2_trx) < 0)
+        perror("Error : ");
+    gpio();
+    pps_dac_setting(0, DAC_spi_fd);
+    system_ready();
+    
+    // sleep(1);
+    while (1)
+    {
+        if (gpio_get_fd_to_value(44) == 0)
+        {
+            printf("Switch 1 gets pressed!!!\n");
+        }
+        if (gpio_get_fd_to_value(30) == 0)
+        {
+            printf("Switch 2 gets pressed!!!\n");
+        }
+        if (gpio_get_fd_to_value(31) == 0)
+        {
+            printf("Switch 3 gets pressed!!!\n");
+        }
+        amp_set_reset();
+
+        int16_t over_heat_detect = temp_main(1);
+        if (over_heat_detect == 1)
+        {
+            fault_flag = 1;
+            fault();
+        }
+        else
+        {
+            fault_flag = 0;
+            if (over_heat_detect == 0)
+            {
+                overheat_warn_flag = 1;
+            }
+            else
+            {
+                overheat_warn_flag = 0;
+            }
+        }
+        int rf_control = gpio_get_fd_to_value(118); // RF on off control
+        int interlock;
+        // printf("In gpio 118(RF on/off control): %d\n", rf_control);
+        if (rf_control == 1)
+        {
+            printf("RF is ON!!");
+            set_gpio(116, 1);
+
+            interlock = gpio_get_fd_to_value(117); // interlock
+            // printf("In gpio 117(interlock): %d\n", interlock);
+            if (interlock == 1)
+            {
+                printf("\tInterlock is in Open!!!!\n");
+                interlock_fault();
+                interlock_flag = 1;
+                temp=50;
+            }
+            else
+            // interlock signal is low when connected so rf needs to be on
+            {
+                printf("\tInterlock is Connected!!!!\n");
+                interlock_flag = 0;
+            }
+        
+                
+                
+        }
+        else
+        {
+            printf("RF is OFF!!\n");
+            printf("fault flag %d",fault_flag);
+            set_gpio(116, 0);
+            interlock_flag = 1;
+            temp=50;
+            system_ready();
+        }
+
+
+        int on_off_control()
+        {
+            int rf_control = gpio_get_fd_to_value(118); // RF on off control
+            int interlock;
+            // printf("In gpio 118(RF on/off control): %d\n", rf_control);
+            if (rf_control == 1)
+            {
+                //printf("RF is ON!!");
+                //set_gpio(116, 1);
+
+                interlock = gpio_get_fd_to_value(117); // interlock
+                // printf("In gpio 117(interlock): %d\n", interlock);
+                if (interlock == 1)
+                {
+                    //printf("\tInterlock is in Open!!!!\n");
+                    //interlock_fault();
+                    interlock_flag = 1;
+                    temp=50;
+                    prev_temp=0;
+                }
+                else
+                // interlock signal is low when connected so rf needs to be on
+                {
+                    //printf("\tInterlock is Connected!!!!\n");
+                    interlock_flag = 0;
+                    prev_temp=temp;
+                    temp=temp;
+                    final_forward_power=final_forward_power_init;
+                }
+            }
+            else
+            {
+               // printf("RF is OFF!!\n");
+                //printf("fault flag %d",fault_flag);
+                //set_gpio(116, 0);
+                interlock_flag = 1;
+                temp=50;
+                prev_temp=0;
+                //system_ready();
+            }
+            return interlock_flag;
+            /*double power_test() //function to test random power set points
+            {
+                double num;
+                if(count==0)
+                {
+                num = rand() % 600 ; // use rand() function to get the random number 
+                }
+                if(interlock_flag!=1)
+                {
+                    num=num;
+                } 
+                else
+                {
+                    num=0;
+                } 
+                return num;
+            }*/
+             
+        
+       
+            
+        }
+
+        double power_test()
+        {
+            uint16_t data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+            out=data*3;
+            //out=out;
+            if (out>=610)  //limited for 600 W
+            {
+                out=600;
+            }
+            else
+            {
+                out=out;
+            }
+            return out;
+        }
+       
+
+        uint16_t data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+        // printf("data: %d\n", data);
+        //double out = data * 0.05;
+        out=power_test();
+        out=(out/60);
+        if (out > 7)
+        {
+            out = out - 0.05;
+        }
+        //int power_set = out * 60;
+        //setting_power_buffer[0]=power_set;
+        // printf("power_set vaue: %d\n",power_set);
+        printf("Analog input for setting RF power: %0.2f V\t", out);
+        if ((interlock == 1) | (rf_control == 0) | ref_fault_flag | fault_flag)
+        {
+            printf("Setting 0 Watt\n");
+        }
+        else
+        {
+            //out = out * 60;
+            out=power_test();
+            printf("Setting %d Watt\n", (int)out);
+            //fault_flag=1;
+            //printf("fault flag %d",fault_flag);
+        }
+
+        if (fault_flag)
+        {
+            pps_dac_setting(0, DAC_spi_fd);
+        }
+        else
+        {
+            if (on_off_control())
+            {
+                pps_dac_setting(0, DAC_spi_fd);
+            }
+            else
+            {
+                if (ref_fault_flag)
+                {
+                    pps_dac_setting(0, DAC_spi_fd);
+                }
+                else
+                {
+                    if (overheat_warn_flag)
+                    {
+                        while(on_off_control()==0)
+                        {
+                            data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                            //out = data * 0.05 * 60;
+                            out=power_test();
+                            printf("Setting %d Watt\n", (int)out);
+                            //printf("\n out : %lf",out);
+                            error = (out-final_forward_power);
+                            //printf("\n error : %lf",error);
+                            if (((((int)(abs(error)))>(int)((0.02*out))) && exit_flag) && (on_off_control()==0))
+                            {
+                                //final_forward_power_temp=0;
+                                //temp=0;
+                                //prev_temp=0;
+                                while((set_matched_flag_for && exit_flag) && (interlock_flag==0)) //checking for reflected_power > 200 w
+                                {
+                                    interlock_flag=on_off_control();
+                                    data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                                    //out = data * 0.05 * 60;
+                                    out=power_test();
+                                    printf("Setting %d Watt\n", (int)out);
+                                    printf("\n out_@_RF ON in PID control: %lf",out);
+                                    //double forward_power = PG10_EMB_read_register(EMB_spi_fd, 0x08, 2, 0, spi4_trx);
+                                    error = (out-final_forward_power_temp);
+                                    printf("\n error_@_RF ON in PID control : %lf\n",error);
+                                    if ((int)(abs(error)) > (int)((0.2*out))) //err > 10% set value
+                                    {
+                                        kp=0.005; //0.5% gain
+                                    }
+                                    else if((int)((0.1*out)) < (int)(abs(error)) < (int)((0.2*out))) //err b/w 10%,20%
+                                    {
+                                        kp=0.003; // 0.3% gain
+                                    }
+                                    else       //err < 10%
+                                    {
+                                        kp=0.001; //0.1% gain
+                                    }
+                                    P_control = kp*t_temp*error; // 0.1 % gain
+                                    printf("kp : %lf\n",P_control);
+                                    I_temp = (error + I_pe)/2;   //integral value
+                                    //printf("integral : %lf",I_temp);
+                                    I_control = ki*I_temp*t_temp; //0.1 % gain
+                                    printf("ki : %lf\n",I_control);
+                                    D_temp =(error-D_pe);   
+                                    //printf("derivative : %lf",D_temp);     // derivative
+                                    D_control = kd*D_temp*t_temp; // 0.1 % gain
+                                    printf("kd: %lf\n",D_control);
+                                    I_pe = D_pe = error;
+                                    if (error>=0)
+                                    {
+                                        offset=0.5;    //temp conversion offset
+                                    }
+                                    else
+                                    {
+                                        offset= -0.5;
+                                    }
+                                    temp_PID= (int32_t)(P_control+I_control+D_control+offset); //casting double to int
+                                    if((int)((0.01*out))<=(int)(abs(error))<=(int)((0.04*out)))
+                                    {
+                                        //small increment if error within 0.1% and 0.4% (change 2 to 1 if oscillates)
+                                        printf("err sign %d ",(int32_t)(((int32_t)(abs(error)))/(((int32_t)error))));
+                                        temp_PID=ceil(temp_PID+((1)*(int32_t)(((int32_t)(abs(error)))/(((int32_t)error)))));  
+                                        int32_t temp_1=ceil(temp_PID);   //DAC val for reference printing
+                                        printf("temp value to avoid oscillation in PID control %d\n",temp_1);
+                                        temp = temp_PID+prev_temp;
+                                    }
+                                    else
+                                    {
+                                        temp=temp;
+                                        int32_t temp_1=temp;   //DAC val for reference printing
+                                        printf("temp value  in PID control%d\n",temp_1);
+                                        temp = temp+prev_temp;
+                                    }
+                                    //printf("temp : %d",temp);
+                                    Volt_cur_forw_ref_load_Set(DAC_spi_fd, DAC_DA2_SEL_CMD, spi1_trx, temp);
+                                    prev_temp = temp;
+                                    printf("\n prev DAC val in PID control %d",prev_temp);
+                                    if (ref_fault_flag==1)
+                                    {
+                                        set_matched_flag_for = 0;
+                                    }
+                                    //uint16_t forward_power = PG10_EMB_read_register(EMB_spi_fd, 0x08, 2, 0, spi4_trx);
+                                    forw = 0;
+                                    usleep(20000); //20 ms delay
+                                    for (int i = 0; i < 30; i++)
+                                    {
+                                        forward_power = avg_value(EMB_spi_fd, 1);
+                                        final_forward_power_temp = calibrated_result(forward_power, 1);
+                                        forw = final_forward_power_temp + forw;
+                                    }
+                                    final_forward_power_temp = forw / 30;
+                                    printf("\nForward power_loop in PID control: %d Watt\n", (int)ceil(final_forward_power_temp));
+                                    int error_2= (int)(out-final_forward_power_temp);
+                                    //int count=1;
+                                    if (count>=5)
+                                    {
+                                        count=0;
+                                    }
+                                    else
+                                    {
+                                        count=count;
+                                    }
+
+                                    if(((int)(abs(error_2))<=(int)((0.01*out))) && (count==0))
+                                    {
+                                        printf("\n abs of err_@_RF ON val in PID control%d",abs(error_2));
+                                        printf("\n exiting PID\n");
+                                        exit_flag=0;
+                                        temp=temp;
+
+                                    }
+                                    count+=1;
+                                    printf("count is :%d",count);
+                                }
+                            }
+                            else
+                            {
+                                //temp=temp;
+                                printf("\nDAC val in stable PID%d\n",temp);
+                                uint16_t data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                                //out=data*0.05*60;
+                                out=power_test();
+                                printf("\nsetting %lf watt in stable PID\n",out);
+                                Volt_cur_forw_ref_load_Set(DAC_spi_fd, DAC_DA2_SEL_CMD, spi1_trx, temp);
+                                prev_temp=temp;
+                                analog_main();
+                                forw = 0;
+                                usleep(20000); //20ms delay
+                                for (int i = 0; i < 30; i++)
+                                {
+                                    forward_power = avg_value(EMB_spi_fd, 1);
+                                    final_forward_power = calibrated_result(forward_power, 1);
+                                    forw = final_forward_power + forw;
+                                }
+                                final_forward_power = forw / 30;
+                                //final_forward_power_temp=final_forward_power;
+                                // // Reflected power
+                                uint16_t reflected_power = PG10_EMB_read_register(EMB_spi_fd, 0x00, 1, 0, spi4_trx);
+                                usleep(1000);
+                                // reflected power calibration
+
+                                long double ref = 0;
+                                double final_reflected_power;
+                                for (int i = 0; i < 10; i++)
+                                {
+                                    reflected_power = avg_value(EMB_spi_fd, 0);
+                                    final_reflected_power = calibrated_result(reflected_power, 0);
+                                    ref = final_reflected_power + ref;
+                                }
+                                final_reflected_power = ref / 10;
+                                set_gpio(113, 0);
+                                int load_power = final_forward_power - final_reflected_power;
+                                dac_set(DAC_forw_ref_pow_spi_fd, final_forward_power, final_reflected_power, load_power);
+                                printf("Forward power in stable PID  : %d Watt\n", (int)ceil(final_forward_power));
+                                printf("Reflected power in stable PID: %lf Watt\n", final_reflected_power);
+                                data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                                //out = data * 0.05 * 60;
+                                out=power_test();
+                                printf("\n out in stable PID : %lf",out);
+                                error = (out-final_forward_power);
+                                printf("\n error in stable PID : %lf",error);
+                                if((int)(abs(error))>(int)((0.02*out)))
+                                {
+                                    
+                                    printf("\n abs of err_@_RF ON val in stable PID %d",abs(error));
+                                    printf("\nentering PID\n");
+                                    exit_flag=1;
+                                    final_forward_power_temp=final_forward_power;
+
+
+                                }
+                                    
+                                if (final_reflected_power > 200)
+                                {
+                                    printf("Max Power Detected!!!!\n");
+                                    ref_fault_flag = 1;
+                                    set_gpio(113, 1);
+                                    fault();
+                                }
+                                else
+                                {
+                                    ref_fault_flag = 0;
+                                }
+                                int trip;
+                                // line_1:
+                                trip = gpio_get_fd_to_value(123);
+                                // printf("Amplifier Trip from Meter Board: %d\n",trip);
+                                if (trip == 0)
+                                {
+                                    printf("Amplifier Trip Signal from Meter Board Detected!!!\n");
+                                }
+                                // dac_set(DAC_forw_ref_pow_spi_fd,2.352949,120.000399,240.000798);
+                                // usleep(800000);
+                                if(count>50)
+                                {
+                                    count=0;
+                                }
+                                else
+                                {
+                                    count=count;
+                                }
+                                if(count==0)
+                                {
+                                    //out=(double)((rand()%(590-10+1)) + 10);
+                                }
+                                else
+                                {
+                                    out=out;
+                                }
+                                count+=1;
+                                printf("\ncount is : %d",count);
+                                printf("\n");
+                                
+                            }
+                        }
+                    
+                    }
+                    else
+                    {
+                    rf_within_regulation();  //PID controller
+                      while(on_off_control()==0)
+                        {
+                            data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                            //out = data * 0.05 * 60;
+                            out=power_test();
+                            printf("Setting %d Watt\n", (int)out);
+                            //printf("\n out : %lf",out);
+                            error = (out-final_forward_power);
+                            //printf("\n error : %lf",error);
+                            if (((((int)(abs(error)))>(int)((0.02*out))) && exit_flag) && (on_off_control()==0))
+                            {
+                                //final_forward_power_temp=0;
+                                //temp=0;
+                                //prev_temp=0;
+                                while((set_matched_flag_for && exit_flag) && (interlock_flag==0)) //checking for reflected_power > 200 w
+                                {
+                                    interlock_flag=on_off_control();
+                                    data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                                    //out = data * 0.05 * 60;
+                                    out=power_test();
+                                    printf("Setting %d Watt\n", (int)out);
+                                    printf("\n out_@_RF ON in PID control: %lf",out);
+                                    //double forward_power = PG10_EMB_read_register(EMB_spi_fd, 0x08, 2, 0, spi4_trx);
+                                    error = (out-final_forward_power_temp);
+                                    printf("\n error_@_RF ON in PID control : %lf\n",error);
+                                    if ((int)(abs(error)) > (int)((0.2*out))) //err > 10% set value
+                                    {
+                                        kp=0.005; //0.5% gain
+                                    }
+                                    else if((int)((0.1*out)) < (int)(abs(error)) < (int)((0.2*out))) //err b/w 10%,20%
+                                    {
+                                        kp=0.003; // 0.3% gain
+                                    }
+                                    else       //err < 10%
+                                    {
+                                        kp=0.001; //0.1% gain
+                                    }
+                                    P_control = kp*t_temp*error; // 0.1 % gain
+                                    printf("kp : %lf\n",P_control);
+                                    I_temp = (error + I_pe)/2;   //integral value
+                                    //printf("integral : %lf",I_temp);
+                                    I_control = ki*I_temp*t_temp; //0.1 % gain
+                                    printf("ki : %lf\n",I_control);
+                                    D_temp =(error-D_pe);   
+                                    //printf("derivative : %lf",D_temp);     // derivative
+                                    D_control = kd*D_temp*t_temp; // 0.1 % gain
+                                    printf("kd: %lf\n",D_control);
+                                    I_pe = D_pe = error;
+                                    if (error>=0)
+                                    {
+                                        offset=0.5;    //temp conversion offset
+                                    }
+                                    else
+                                    {
+                                        offset= -0.5;
+                                    }
+                                    temp_PID= (int32_t)(P_control+I_control+D_control+offset); //casting double to int
+                                    if((int)((0.01*out))<=(int)(abs(error))<=(int)((0.04*out)))
+                                    {
+                                        //small increment if error within 0.1% and 0.4% (change 2 to 1 if oscillates)
+                                        printf("err sign %d ",(int32_t)(((int32_t)(abs(error)))/(((int32_t)error))));
+                                        temp_PID=ceil(temp_PID+((1)*(int32_t)(((int32_t)(abs(error)))/(((int32_t)error)))));   
+                                        int32_t temp_1=ceil(temp_PID);   //DAC val for reference printing
+                                        printf("temp value to avoid oscillation in PID control %d\n",temp_1);
+                                        temp = temp_PID+prev_temp;
+                                    }
+                                    else
+                                    {
+                                        temp=temp;
+                                        int32_t temp_1=temp;   //DAC val for reference printing
+                                        printf("temp value  in PID control%d\n",temp_1);
+                                        temp = temp+prev_temp;
+                                    }
+                                    //printf("temp : %d",temp);
+                                    Volt_cur_forw_ref_load_Set(DAC_spi_fd, DAC_DA2_SEL_CMD, spi1_trx, temp);
+                                    prev_temp = temp;
+                                    printf("\n prev DAC val in PID control %d",prev_temp);
+                                    if (ref_fault_flag==1)
+                                    {
+                                        set_matched_flag_for = 0;
+                                    }
+                                    //uint16_t forward_power = PG10_EMB_read_register(EMB_spi_fd, 0x08, 2, 0, spi4_trx);
+                                    forw = 0;
+                                    usleep(20000); //20 ms delay
+                                    for (int i = 0; i < 30; i++)
+                                    {
+                                        forward_power = avg_value(EMB_spi_fd, 1);
+                                        final_forward_power_temp = calibrated_result(forward_power, 1);
+                                        forw = final_forward_power_temp + forw;
+                                    }
+                                    final_forward_power_temp = forw / 30;
+                                    printf("\nForward power_loop in PID control: %d Watt\n", (int)ceil(final_forward_power_temp));
+                                    int error_2= (int)(out-final_forward_power_temp);
+                                    //int count=1;
+                                    if (count>=6) //check for forw in 0.1% out
+                                    {
+                                        count=0;
+                                    }
+                                    else
+                                    {
+                                        count=count;
+                                    }
+
+                                    if(((int)(abs(error_2))<=(int)((0.01*out))) && (count==0))
+                                    {
+                                        printf("\n abs of err_@_RF ON val in PID control%d",abs(error_2));
+                                        printf("\n exiting PID\n");
+                                        exit_flag=0;
+                                        temp=temp;
+
+                                    }
+                                    count+=1;
+                                    printf("count is :%d",count);
+                                }
+                            }
+                            else
+                            {
+                                //temp=temp;
+                                printf("\nDAC val in stable PID%d\n",temp);
+                                uint16_t data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                                //out=data*0.05*60;
+                                out=power_test();
+                                printf("\nsetting %lf watt in stable PID\n",out);
+                                Volt_cur_forw_ref_load_Set(DAC_spi_fd, DAC_DA2_SEL_CMD, spi1_trx, temp);
+                                prev_temp=temp;
+                                analog_main();
+                                forw = 0;
+                                usleep(20000); //20ms delay
+                                for (int i = 0; i < 30; i++)
+                                {
+                                    forward_power = avg_value(EMB_spi_fd, 1);
+                                    final_forward_power = calibrated_result(forward_power, 1);
+                                    forw = final_forward_power + forw;
+                                }
+                                final_forward_power = forw / 30;
+                                //final_forward_power_temp=final_forward_power;
+                                // // Reflected power
+                                uint16_t reflected_power = PG10_EMB_read_register(EMB_spi_fd, 0x00, 1, 0, spi4_trx);
+                                usleep(1000);
+                                // reflected power calibration
+
+                                long double ref = 0;
+                                double final_reflected_power;
+                                for (int i = 0; i < 10; i++)
+                                {
+                                    reflected_power = avg_value(EMB_spi_fd, 0);
+                                    final_reflected_power = calibrated_result(reflected_power, 0);
+                                    ref = final_reflected_power + ref;
+                                }
+                                final_reflected_power = ref / 10;
+                                set_gpio(113, 0);
+                                int load_power = final_forward_power - final_reflected_power;
+                                dac_set(DAC_forw_ref_pow_spi_fd, final_forward_power, final_reflected_power, load_power);
+                                printf("Forward power in stable PID  : %d Watt\n", (int)ceil(final_forward_power));
+                                printf("Reflected power in stable PID: %lf Watt\n", final_reflected_power);
+                                data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+                                //out = data * 0.05 * 60;
+                                out=power_test();
+                                printf("\n out in stable PID : %lf",out);
+                                error = (out-final_forward_power);
+                                printf("\n error in stable PID : %lf",error);
+                                if((int)(abs(error))>(int)((0.02*out)))
+                                {
+                                    
+                                    printf("\n abs of err_@_RF ON val in stable PID %d",abs(error));
+                                    printf("\nentering PID\n");
+                                    exit_flag=1;
+                                    final_forward_power_temp=final_forward_power;
+
+
+                                }
+                                    
+                                if (final_reflected_power > 200)
+                                {
+                                    printf("Max Power Detected!!!!\n");
+                                    ref_fault_flag = 1;
+                                    set_gpio(113, 1);
+                                    fault();
+                                }
+                                else
+                                {
+                                    ref_fault_flag = 0;
+                                }
+                                int trip;
+                                // line_1:
+                                trip = gpio_get_fd_to_value(123);
+                                // printf("Amplifier Trip from Meter Board: %d\n",trip);
+                                if (trip == 0)
+                                {
+                                    printf("Amplifier Trip Signal from Meter Board Detected!!!\n");
+                                }
+                                // dac_set(DAC_forw_ref_pow_spi_fd,2.352949,120.000399,240.000798);
+                                // usleep(800000);
+                                if(count>50)
+                                {
+                                    count=0;
+                                }
+                                else
+                                {
+                                    count=count;
+                                }
+                                if(count==0)
+                                {
+                                    //out=(double)((rand()%(590-10+1)) + 10);
+                                }
+                                else
+                                {
+                                    out=out;
+                                }
+                                count+=1;
+                                printf("\ncount is : %d",count);
+                                printf("\n");
+                                
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        //setting_power_buffer[1] = setting_power_buffer[0];
+        //printf("POWER TEMP: %d\n",setting_power_buffer[1]);
+        analog_main();
+        // READ CHANNEL_2
+        // // // Forward power
+        //uint16_t forward_power = PG10_EMB_read_register(EMB_spi_fd, 0x08, 2, 0, spi4_trx);
+        // usleep(10);
+        //  forward power calibration
+        temp=50;
+        Volt_cur_forw_ref_load_Set(DAC_spi_fd, DAC_DA2_SEL_CMD, spi1_trx, temp);
+        forw = 0;
+        usleep(10000); //10ms delay
+        for (int i = 0; i < 30; i++)
+        {
+            forward_power = avg_value(EMB_spi_fd, 1);
+            final_forward_power = calibrated_result(forward_power, 1);
+            forw = final_forward_power + forw;
+        }
+        final_forward_power_init = forw / 30;
+        // // Reflected power
+        uint16_t reflected_power = PG10_EMB_read_register(EMB_spi_fd, 0x00, 1, 0, spi4_trx);
+        usleep(10);
+        // reflected power calibration
+
+        long double ref = 0;
+        double final_reflected_power;
+        for (int i = 0; i < 10; i++)
+        {
+            reflected_power = avg_value(EMB_spi_fd, 0);
+            final_reflected_power = calibrated_result(reflected_power, 0);
+            ref = final_reflected_power + ref;
+        }
+        final_reflected_power = ref / 10;
+        set_gpio(113, 0);
+        int load_power = final_forward_power - final_reflected_power;
+        dac_set(DAC_forw_ref_pow_spi_fd, final_forward_power_init, final_reflected_power, load_power);
+        printf("Forward power_init @ RF OFF   : %d Watt\n", (int)floor(final_forward_power_init));
+        printf("Reflected power @ RF OFF: %lf Watt\n", (int)floor(final_reflected_power));
+        data = SPI1SS1_ADC_readRegister(SPI1SS1_ADC_MCU_fd, spi3_trx);
+        out = data * 0.05 * 60;
+        printf("\n out_@_RF OFF : %lf",out);
+        error = (out-final_forward_power_init);
+        printf("\n error_@_RF OFF : %lf",error);
+        if((int)(abs(error))>(int)((0.015*out)))
+        {
+            
+            printf("\n abs of err_@_RF OFF val %d\n",abs(error));
+            exit_flag=1;
+            final_forward_power=final_forward_power_init;
+
+
+        }
+            
+        if (final_reflected_power > 200)
+        {
+            printf("Max Power Detected!!!!\n");
+            ref_fault_flag = 1;
+            set_gpio(113, 1);
+            fault();
+        }
+        else
+        {
+            ref_fault_flag = 0;
+        }
+        int trip;
+        // line_1:
+        trip = gpio_get_fd_to_value(123);
+        // printf("Amplifier Trip from Meter Board: %d\n",trip);
+        if (trip == 0)
+        {
+            printf("Amplifier Trip Signal from Meter Board Detected!!!\n");
+        }
+        // dac_set(DAC_forw_ref_pow_spi_fd,2.352949,120.000399,240.000798);
+        // usleep(800000);
+        printf("\n");
+    }
+    return 0;
+}

@@ -1,0 +1,141 @@
+sol flag added 
+else if(sol_flag)
+                    {
+                        pps_dac_value=0;
+                        printf("fixing imp mismatch\n");
+                        sol_flag=0;
+                        overshoot_flag=1;
+                    }
+
+making dac 0
+again perform overshoot once //3.06pm this not working
+sol: 3.08pm dont make shoot again
+
+3.15pm not performing shoot again wont work 
+
+make dac =60 not 0;
+_________________________________________________________________________________________________________________
+Temperature : 34.00 °C
+raw_adc 134
+adc_manipulated 6.700000
+Setting 402 Watt
+forw pow in check:    9.102677 W
+Err: 392.897323
+stable loopinit flag 0
+abs_error 392.897323
+overshoot
+dac val after const 205
+raw forw 329.600000
+forw pow :    0.000000 W
+raw ref 674.100000
+Ref pow:     0.000000 W
+
+raw_adc 134
+adc_manipulated 6.700000
+Err: 402.000000
+
+Temperature : 34.00 °C
+raw_adc 134
+adc_manipulated 6.700000
+Setting 402 Watt
+forw pow in check:    0.000000 W
+Err: 402.000000
+stable loopinit flag 0
+abs_error 402.000000
+ PPS PID value: 173
+dac val after const 255
+raw forw 1901.700000
+forw pow :    96.878369 W
+raw ref 1884.800000
+Ref pow:     54.373147 W
+
+raw_adc 134
+adc_manipulated 6.700000
+Err: 305.121631
+
+Temperature : 34.00 °C
+raw_adc 134
+adc_manipulated 6.700000
+Setting 402 Watt
+forw pow in check:    96.878369 W
+Err: 305.121631
+stable loopinit flag 0
+abs_error 305.121631
+fixing imp mismatch
+dac val after const 0
+raw forw 1642.700000
+forw pow :    9.269137 W
+raw ref 1557.500000
+Ref pow:     3.565854 W
+
+raw_adc 134
+adc_manipulated 6.700000
+Err: 392.730863
+
+Temperature : 34.00 °C
+raw_adc 134
+adc_manipulated 6.700000
+Setting 402 Watt
+forw pow in check:    9.269137 W
+Err: 392.730863
+stable loopinit flag 0
+abs_error 392.730863
+overshoot
+dac val after const 205
+raw forw 329.600000
+forw pow :    0.000000 W
+raw ref 674.500000
+Ref pow:     0.000000 W
+
+raw_adc 134
+adc_manipulated 6.700000
+Err: 402.000000
+
+Temperature : 34.00 °C
+raw_adc 134
+adc_manipulated 6.700000
+Setting 402 Watt
+forw pow in check:    0.000000 W
+Err: 402.000000
+stable loopinit flag 0
+abs_error 402.000000
+ PPS PID value: 173
+dac val after const 255
+raw forw 1900.200000
+forw pow :    96.004532 W
+raw ref 1886.200000
+Ref pow:     55.149086 W
+
+raw_adc 134
+adc_manipulated 6.700000
+Err: 305.995468
+
+Temperature : 34.00 °C
+raw_adc 134
+adc_manipulated 6.700000
+Setting 402 Watt
+forw pow in check:    96.004532 W
+Err: 305.995468
+stable loopinit flag 0
+abs_error 305.995468
+fixing imp mismatch
+dac val after const 0
+raw forw 1636.900000
+forw pow :    8.778671 W
+raw ref 1557.400000
+Ref pow:     3.565854 W
+
+raw_adc 134
+adc_manipulated 6.700000
+Err: 393.221329
+
+
+
+
+
+                    if ((pps_dac_value>=245)&&(((int)final_forward_power)<600))
+                    {
+                        //printf("abs_error %d\n", (fabs(error_cal)));
+                        // stable_loop_init_flag = 1;
+                        sol_flag=1;
+                    }
